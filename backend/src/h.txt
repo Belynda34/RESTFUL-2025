@@ -1,0 +1,173 @@
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const { PrismaClient } = require('@prisma/client');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+const prisma = new PrismaClient();
+app.use(cors());
+app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+
+// Middleware to verify JWT
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+};
+
+// User Registration
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({
+      data: { username, password: hashedPassword },
+    });
+    res.status(201).json({ message: 'User registered', userId: user.id });
+  } catch (error) {
+    res.status(400).json({ error: 'Username already exists' });
+  }
+});
+
+// User Login
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const user = await prisma.user.findUnique({ where: { username } });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ userId: user.id, username }, JWT_SECRET, { expiresIn: '1h' });
+    res.json({ token });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Create Parking
+app.post('/api/parkings', authenticateToken, async (req, res) => {
+  const { code, name, totalSpaces, location, feePerHour } = req.body;
+  try {
+    const parking = await prisma.parking.create({
+      data: { code, name, totalSpaces, availableSpaces: totalSpaces, location, feePerHour },
+    });
+    res.status(201).json(parking);
+  } catch (error) {
+    res.status(400).json({ error: 'Error creating parking' });
+  }
+});
+
+// Get All Parkings
+app.get('/api/parkings', authenticateToken, async (req, res) => {
+  const parkings = await prisma.parking.findMany();
+  res.json(parkings);
+});
+
+// Register Car Entry
+app.post('/api/car-entry', authenticateToken, async (req, res) => {
+  const { plateNumber, parkingCode } = req.body;
+  try {
+    const parking = await prisma.parking.findUnique({ where: { code: parkingCode } });
+    if (!parking || parking.availableSpaces <= 0) {
+      return res.status(400).json({ error: 'No available spaces or invalid parking code' });
+    }
+
+    const entry = await prisma.carEntry.create({
+      data: {
+        plateNumber,
+        parkingCode,
+        entryDateTime: new Date(),
+        exitDateTime: null,
+        chargedAmount: 0,
+      },
+    });
+
+    await prisma.parking.update({
+      where: { code: parkingCode },
+      data: { availableSpaces: parking.availableSpaces - 1 },
+    });
+
+    const ticket = `Ticket ID: ${entry.id}\nPlate: ${plateNumber}\nParking: ${parkingCode}\nEntry: ${entry.entryDateTime}`;
+    res.status(201).json({ entry, ticket });
+  } catch (error) {
+    console.error("Error in registering car entry:",error)
+    res.status(500).json({message:"Internal server error "})
+  }
+});
+
+// Register Car Exit
+app.post('/api/car-exit/:entryId', authenticateToken, async (req, res) => {
+  const { entryId } = req.params;
+  try {
+    const entry = await prisma.carEntry.findUnique({ where: { id: parseInt(entryId) } });
+    if (!entry || entry.exitDateTime) {
+      return res.status(400).json({ error: 'Invalid entry or already exited' });
+    }
+
+    const parking = await prisma.parking.findUnique({ where: { code: entry.parkingCode } });
+    const exitDateTime = new Date();
+    const hoursParked = Math.ceil((exitDateTime - entry.entryDateTime) / (1000 * 60 * 60));
+    const chargedAmount = hoursParked * parking.feePerHour;
+
+    const updatedEntry = await prisma.carEntry.update({
+      where: { id: parseInt(entryId) },
+      data: { exitDateTime, chargedAmount },
+    });
+
+    await prisma.parking.update({
+      where: { code: entry.parkingCode },
+      data: { availableSpaces: parking.availableSpaces + 1 },
+    });
+
+    const bill = `Bill for Entry ID: ${entryId}\nPlate: ${entry.plateNumber}\nDuration: ${hoursParked} hours\nTotal: $${chargedAmount}`;
+    res.json({ entry: updatedEntry, bill });
+  } catch (error) {
+    res.status(400).json({ error: 'Error processing car exit' });
+  }
+});
+
+// Get Outgoing Cars Between Dates
+app.get('/api/outgoing-cars', authenticateToken, async (req, res) => {
+  const { startDate, endDate } = req.query;
+  try {
+    const entries = await prisma.carEntry.findMany({
+      where: {
+        exitDateTime: {
+          gte: new Date(startDate),
+          lte: new Date(endDate),
+        },
+      },
+    });
+    res.json(entries);
+  } catch (error) {
+    res.status(400).json({ error: 'Error fetching outgoing cars' });
+  }
+});
+
+// Get All Entered Cars
+app.get('/api/entered-cars', authenticateToken, async (req, res) => {
+  const entries = await prisma.carEntry.findMany({
+    where: { exitDateTime: null },
+  });
+  res.json(entries);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+
+// model User { id Int @id @default(autoincrement()) username String @unique password String }
+
+// model Parking { id Int @id @default(autoincrement()) code String @unique name String totalSpaces Int availableSpaces Int location String feePerHour Float }
+
+// model CarEntry { id Int @id @default(autoincrement()) plateNumber String parkingCode String entryDateTime DateTime exitDateTime DateTime? chargedAmount Float @default(0) }
